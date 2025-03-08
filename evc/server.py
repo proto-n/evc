@@ -4,6 +4,8 @@ import tornado.web
 import socketio
 import json
 import asyncio
+import torch
+import torchaudio
 from datetime import datetime
 from collections import deque
 
@@ -11,6 +13,10 @@ class AppHandler(socketio.AsyncNamespace):
     def __init__(self, args):
         self.loop = asyncio.get_event_loop()
         self.port = args['port']
+        self.audio_buffer = []
+        self.file_counter = 0
+        self.last_save = datetime.now()
+        self.sample_rate = 22050
         super(AppHandler, self).__init__('/')
 
     def get_state(self):
@@ -28,10 +34,33 @@ class AppHandler(socketio.AsyncNamespace):
     async def background_tick(self):
         while True:
             await asyncio.sleep(1)
-            # self.send_state_sync()
+            current_time = datetime.now()
+            time_diff = (current_time - self.last_save).total_seconds()
+            
+            if time_diff >= 5 and self.audio_buffer:
+                self.save_wav()
+                self.last_save = current_time
 
     async def on_command(self, sid, data):
         self.emit('command', data)
+
+    async def on_audio_data(self, sid, data):
+        self.audio_buffer.extend(data)
+
+    def save_wav(self):
+        if not self.audio_buffer:
+            return
+        
+        output_dir = "recordings"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        filename = os.path.join(output_dir, f"recording_{self.file_counter}.wav")
+        audio_data = torch.tensor(self.audio_buffer, dtype=torch.float32).unsqueeze(0)
+        torchaudio.save(filename, audio_data, self.sample_rate)
+        
+        print(f"Saved WAV file: {filename} with {len(self.audio_buffer)} samples")
+        self.audio_buffer = []
+        self.file_counter += 1
 
     async def on_connect(self, sid, environ):
         await self.send_state()

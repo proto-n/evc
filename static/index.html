@@ -1,15 +1,87 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Simple Socket.IO Demo</title>
+  <title>Audio Recording Demo</title>
+  <style>
+    .recording { background-color: red !important; }
+    select, button { padding: 10px; margin: 10px; }
+  </style>
 </head>
 <body>
+  <select id="deviceSelect"></select>
+  <button id="recordButton">Start Recording</button>
+
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/3.1.3/socket.io.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
   <script type="text/javascript">
-    var socket = io(location.protocol+'//'+location.hostname+':{{ port }}/');
+    const socket = io(location.protocol+'//'+location.hostname+':{{ port }}/');
+    let isRecording = false;
+    let mediaRecorder;
+    let audioContext;
+    let sourceNode;
+    let processorNode;
+    const SAMPLE_RATE = 22050;
+
     socket.on('connect', function(){
       console.log("Successfully connected to server");
+    });
+
+    // Get available audio devices
+    async function getDevices() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audioDevices = devices.filter(device => device.kind === 'audioinput');
+      const select = document.getElementById('deviceSelect');
+      select.innerHTML = '';
+      audioDevices.forEach(device => {
+        const option = document.createElement('option');
+        option.value = device.deviceId;
+        option.text = device.label || `Microphone ${select.length + 1}`;
+        select.appendChild(option);
+      });
+    }
+
+    // Request microphone permission and list devices
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then(stream => {
+        stream.getTracks().forEach(track => track.stop());
+        getDevices();
+      });
+
+    document.getElementById('recordButton').addEventListener('click', async () => {
+      if (!isRecording) {
+        const deviceId = document.getElementById('deviceSelect').value;
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: deviceId ? { exact: deviceId } : undefined,
+            sampleRate: SAMPLE_RATE,
+            channelCount: 1
+          }
+        });
+
+        audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+        sourceNode = audioContext.createMediaStreamSource(stream);
+        processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+
+        sourceNode.connect(processorNode);
+        processorNode.connect(audioContext.destination);
+
+        processorNode.onaudioprocess = (e) => {
+          const audioData = e.inputBuffer.getChannelData(0);
+          socket.emit('audio_data', Array.from(audioData));
+        };
+
+        document.getElementById('recordButton').textContent = 'Stop Recording';
+        document.getElementById('recordButton').classList.add('recording');
+      } else {
+        if (processorNode) {
+          processorNode.disconnect();
+          sourceNode.disconnect();
+          audioContext.close();
+        }
+        document.getElementById('recordButton').textContent = 'Start Recording';
+        document.getElementById('recordButton').classList.remove('recording');
+      }
+      isRecording = !isRecording;
     });
   </script>
 </body>

@@ -10,5 +10,5 @@ setup(
     keywords=['add', 'sub', 'tests'],
     classifiers=[],
     package_data={'static': ['index.html']},
-    install_requires=['python-socketio', 'pandas', 'numpy', 'tornado'],
+    install_requires=['python-socketio', 'pandas', 'numpy', 'tornado', 'torch', 'torchaudio'],
 )
