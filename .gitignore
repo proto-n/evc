@@ -48,3 +48,4 @@ logs/
 .env.production.local
 
 recordings
+hls_stream

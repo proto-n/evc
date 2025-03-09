@@ -11,6 +11,8 @@
   <select id="deviceSelect"></select>
   <button id="recordButton">Start Recording</button>
 
+  http://localhost:{{port}}/hls/stream.m3u8
+
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/3.1.3/socket.io.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
   <script type="text/javascript">
@@ -54,7 +56,10 @@
           audio: {
             deviceId: deviceId ? { exact: deviceId } : undefined,
             sampleRate: SAMPLE_RATE,
-            channelCount: 1
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
           }
         });
 
@@ -66,8 +71,14 @@
         processorNode.connect(audioContext.destination);
 
         processorNode.onaudioprocess = (e) => {
-          const audioData = e.inputBuffer.getChannelData(0);
-          socket.emit('audio_data', Array.from(audioData));
+          if (isRecording) {
+            const audioData = e.inputBuffer.getChannelData(0);
+            const normalizedData = Array.from(audioData);
+            socket.emit('audio_data', {
+              data: normalizedData,
+              clientTime: Date.now() / 1000
+            });
+          }
         };
 
         document.getElementById('recordButton').textContent = 'Stop Recording';
@@ -76,7 +87,7 @@
         if (processorNode) {
           processorNode.disconnect();
           sourceNode.disconnect();
-          audioContext.close();
+          await audioContext.close();
         }
         document.getElementById('recordButton').textContent = 'Start Recording';
         document.getElementById('recordButton').classList.remove('recording');
