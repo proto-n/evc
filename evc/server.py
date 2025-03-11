@@ -15,17 +15,29 @@ import tornado.ioloop
 import tornado.web
 import numpy as np
 import glob
+from typing import Dict, List, Callable
+from collections import defaultdict
 
 PLAYBACK_DELAY = 10  # seconds
 CHUNK_SIZE = 22050 * 5  # 5 seconds at 22050 Hz
 
+class EventEmitter:
+    def __init__(self):
+        self._listeners = defaultdict(list)
+    
+    def on(self, event: str, callback: Callable):
+        self._listeners[event].append(callback)
+        
+    def emit(self, event: str, *args, **kwargs):
+        for callback in self._listeners[event]:
+            callback(*args, **kwargs)
 
 class AppHandler(socketio.AsyncNamespace):
     def __init__(self, args):
         self.loop = asyncio.get_event_loop()
         self.port = args['port']
-        self.streamer = Streamer()
-        self.buffer = ReceiveBuffer(self.streamer)
+        self.buffer = ReceiveBuffer()  # Create buffer first
+        self.streamer = Streamer(self.buffer)  # Pass buffer to streamer
         self.sample_rate = 22050
         self.min_sample_diff = None  # Minimum observed time difference
         self.start_time = None
@@ -70,7 +82,8 @@ class AppHandler(socketio.AsyncNamespace):
         return 
 
     def on_disconnect(self, sid, reason):
-        pass
+        if hasattr(self, 'streamer'):
+            self.streamer.cleanup()
 
 class TornadoHandler(tornado.web.RequestHandler):
     def initialize(self, apphandler, args):
@@ -85,9 +98,9 @@ class TornadoHandler(tornado.web.RequestHandler):
             port=self.args['port']
         )
 
-class ReceiveBuffer:
-    def __init__(self, streamer, sample_rate=22050, segment_duration=5, buffer_delay=10):
-        self.streamer = streamer
+class ReceiveBuffer(EventEmitter):
+    def __init__(self, sample_rate=22050, segment_duration=1, buffer_delay=2):
+        super().__init__()
         self.sample_rate = sample_rate
         self.segment_duration = segment_duration
         self.buffer_delay = buffer_delay
@@ -100,8 +113,9 @@ class ReceiveBuffer:
         self.process_thread.start()
 
     def last_yielded_time(self):
+        """Return the time of the end of the last yielded sample."""
         if self.first_yielded_time is None:
-            self.first_yielded_time = time.time()
+            return time.time()
         return self.first_yielded_time + self.total_yielded / self.sample_rate
 
     def add_audio(self, chunk, offset):
@@ -152,26 +166,68 @@ class ReceiveBuffer:
                 segment_buffer[chunk_offset:end_pos] = chunk
 
             segment_to_send = (segment_buffer * 32767).clamp(-32768, 32767).to(torch.int16)
-            self.streamer.ffmpeg_process.stdin.write(segment_to_send.numpy().tobytes())
-            self.streamer.ffmpeg_process.stdin.flush()
+            # Instead of directly writing to ffmpeg, emit an event
+            self.emit('audio_segment', {
+                "start_time": self.first_yielded_time + start_offset / self.sample_rate,
+                "audio": segment_to_send.numpy().tobytes()
+            })
 
             with self.lock:
                 self.last_yielded_offset = end_offset
                 self.total_yielded += total_samples
 
-
 class Streamer:
-    def __init__(self):
+    def __init__(self, buffer: ReceiveBuffer):
         self.HLS_DIR = 'hls_stream'
         self.cleanup_hls_dir()
-        self.buffer = []  # [(timestamp, chunk), ...]
         self.ffmpeg_process = self.start_hls_stream()
-        # self.feed_thread = threading.Thread(target=self.feed_audio_loop, daemon=True)
-        # self.feed_thread.start()
+        self.input_buffer = deque()
+        self.buffer_lock = threading.Lock()
+        self.running = True
+        
+        # Start writer thread
+        self.writer_thread = threading.Thread(target=self._write_loop, daemon=True)
+        self.writer_thread.start()
+        
+        # Subscribe to buffer's audio segments
+        buffer.on('audio_segment', self.handle_audio_segment)
 
-    def add_audio(self, chunk, timestamp):
-        """Modified to accept timestamp with chunk"""
-        self.buffer.append((timestamp, chunk))
+    def handle_audio_segment(self, segment_dict: Dict):
+        """Just append to buffer instead of writing directly"""
+        with self.buffer_lock:
+            self.input_buffer.append(segment_dict['audio'])
+
+    def _write_loop(self):
+        """Continuously write buffered audio data to ffmpeg"""
+        while self.running:
+            data_to_write = None
+            with self.buffer_lock:
+                if self.input_buffer:
+                    data_to_write = self.input_buffer.popleft()
+            
+            if data_to_write is not None:
+                try:
+                    self.ffmpeg_process.stdin.write(data_to_write)
+                    self.ffmpeg_process.stdin.flush()
+                except (BrokenPipeError, IOError) as e:
+                    print(f"FFmpeg pipe error: {e}")
+                    self.running = False
+                    break
+            else:
+                time.sleep(0.001)
+
+    def cleanup(self):
+        """Cleanup resources"""
+        self.running = False
+        if self.writer_thread.is_alive():
+            self.writer_thread.join(timeout=1.0)
+        if self.ffmpeg_process:
+            try:
+                self.ffmpeg_process.stdin.close()
+                self.ffmpeg_process.terminate()
+                self.ffmpeg_process.wait(timeout=1.0)
+            except Exception as e:
+                self.ffmpeg_process.kill()
 
     def cleanup_hls_dir(self):
         """Remove all existing HLS stream files"""
@@ -220,4 +276,9 @@ def main(args):
     app.listen(args['port'])
     print("running on port", args['port'])
     print("http://localhost:" + str(args['port']))
-    tornado.ioloop.IOLoop.current().start()
+    try:
+        tornado.ioloop.IOLoop.current().start()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        if hasattr(sio, 'apphandler') and hasattr(sio.apphandler, 'streamer'):
+            sio.apphandler.streamer.cleanup()
