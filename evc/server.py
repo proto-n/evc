@@ -14,53 +14,10 @@ import threading
 import tornado.ioloop
 import tornado.web
 import numpy as np
+import glob
 
 PLAYBACK_DELAY = 10  # seconds
 CHUNK_SIZE = 22050 * 5  # 5 seconds at 22050 Hz
-
-class ChunkProcessor:
-    def __init__(self, streamer):
-        self.streamer = streamer
-        self.current_buffer = []
-        self.current_samples = 0
-        self.processing_thread = threading.Thread(target=self.process_loop, daemon=True)
-        self.input_queue = deque()  # Queue of chunks waiting to be processed
-        self.processing_thread.start()
-
-    def add_audio(self, chunk, timestamp):
-        self.current_buffer.append(chunk)
-        self.current_samples += len(chunk)
-        
-        # If we have 5 seconds of audio, queue it for processing
-        if self.current_samples >= CHUNK_SIZE:
-            # Concatenate and split at exactly 5 seconds
-            full_chunk = torch.cat(self.current_buffer)
-            to_process = full_chunk[:CHUNK_SIZE]
-            remainder = full_chunk[CHUNK_SIZE:]
-            
-            # Queue the 5-second chunk for processing
-            self.input_queue.append((time.time(), to_process))
-            
-            # Reset buffer with remainder
-            self.current_buffer = [remainder] if len(remainder) > 0 else []
-            self.current_samples = len(remainder)
-
-    def mock_deep_learning(self, audio):
-        """Mock deep learning processing with 3-second delay"""
-        time.sleep(3)
-        # Simulate some processing (e.g., adding reverb)
-        return audio * 0.8
-
-    def process_loop(self):
-        while True:
-            if self.input_queue:
-                timestamp, chunk = self.input_queue.popleft()
-                print(f"Processing chunk recorded at {timestamp:.2f}")
-                processed = self.mock_deep_learning(chunk)
-                processed = (processed * 32767).to(torch.int16)
-                self.streamer.add_audio(processed, timestamp)
-            else:
-                time.sleep(0.1)
 
 
 class AppHandler(socketio.AsyncNamespace):
@@ -68,30 +25,30 @@ class AppHandler(socketio.AsyncNamespace):
         self.loop = asyncio.get_event_loop()
         self.port = args['port']
         self.streamer = Streamer()
-        self.processor = ChunkProcessor(self.streamer)
+        self.buffer = ReceiveBuffer(self.streamer)
         self.sample_rate = 22050
-        self.min_time_diff = None  # Minimum observed time difference
+        self.min_sample_diff = None  # Minimum observed time difference
+        self.start_time = None
         self.last_stats_time = time.time()
         super(AppHandler, self).__init__('/')
 
     async def on_audio_data(self, sid, data):
         server_time = time.time()
+        if self.start_time is None:
+            self.start_time = time.time()
+        server_samples = (server_time - self.start_time) * self.sample_rate
+        current_sample_diff = server_samples - data['offset']
+        self.min_sample_diff = min(self.min_sample_diff or float('inf'), current_sample_diff)
+
         audio_chunk = torch.tensor(data['data'], dtype=torch.float32)
+        self.buffer.add_audio(audio_chunk, data['offset'])
 
-        time_diff = server_time - data['clientTime']
-        
-        if self.min_time_diff is None or time_diff < self.min_time_diff:
-            self.min_time_diff = time_diff
-            print(f"Updated minimum time difference: {self.min_time_diff:.3f}s")
-
-        estimated_client_time = server_time + self.min_time_diff
-        current_delay = estimated_client_time - data['clientTime']
-        
+        # Print stats periodically
         if server_time - self.last_stats_time >= 5.0:
-            print(f"Current delay: {current_delay*1000:.1f}ms")
+            estimated_client_time = time.time() + self.min_sample_diff / self.sample_rate
+            time_behind = estimated_client_time - server_time
+            print(f"Input network delay: {time_behind:.3f}s")
             self.last_stats_time = server_time
-
-        self.processor.add_audio(audio_chunk, estimated_client_time)
 
     def get_state(self):
         return {}
@@ -128,59 +85,103 @@ class TornadoHandler(tornado.web.RequestHandler):
             port=self.args['port']
         )
 
+class ReceiveBuffer:
+    def __init__(self, streamer, sample_rate=22050, segment_duration=5, buffer_delay=10):
+        self.streamer = streamer
+        self.sample_rate = sample_rate
+        self.segment_duration = segment_duration
+        self.buffer_delay = buffer_delay
+        self.chunks = []  # list of (offset, chunk) tuples
+        self.last_yielded_offset = None  # last yielded sample offset
+        self.first_yielded_time = None
+        self.total_yielded = 0
+        self.lock = threading.Lock()
+        self.process_thread = threading.Thread(target=self._process_segments, daemon=True)
+        self.process_thread.start()
+
+    def last_yielded_time(self):
+        if self.first_yielded_time is None:
+            self.first_yielded_time = time.time()
+        return self.first_yielded_time + self.total_yielded / self.sample_rate
+
+    def add_audio(self, chunk, offset):
+        """Add a new audio chunk with its offset to the buffer."""
+        with self.lock:
+            if self.last_yielded_offset is not None and offset < self.last_yielded_offset:
+                # Drop chunk as it is too old
+                return
+            # If first chunk, initialize our starting time.
+            if self.first_yielded_time is None:
+                self.first_yielded_time = time.time()
+            self.chunks.append((offset, chunk))
+
+    def _process_segments(self):
+        while True:
+            time.sleep(0.01)
+            if self.last_yielded_time() + self.buffer_delay > time.time():
+                continue
+
+            with self.lock:
+                if self.last_yielded_offset is None:
+                    self.last_yielded_offset = min(offset for offset, _ in self.chunks)
+
+            start_offset = self.last_yielded_offset
+            nominal_end_offset = start_offset + (self.segment_duration * self.sample_rate)
+
+            with self.lock:
+                selected = []
+                remaining = []
+                for offset, chunk in self.chunks:
+                    if offset < nominal_end_offset:
+                        selected.append((offset, chunk))
+                    else:
+                        remaining.append((offset, chunk))
+                self.chunks = remaining
+
+            if not selected:
+                end_offset = nominal_end_offset
+            else:
+                end_offset = max(offset + len(chunk) for offset, chunk in selected)
+
+            total_samples = end_offset - start_offset
+            segment_buffer = torch.zeros(total_samples, dtype=torch.float32)
+
+            for offset, chunk in selected:
+                chunk_offset = offset - start_offset
+                end_pos = chunk_offset + len(chunk)
+                segment_buffer[chunk_offset:end_pos] = chunk
+
+            segment_to_send = (segment_buffer * 32767).clamp(-32768, 32767).to(torch.int16)
+            self.streamer.ffmpeg_process.stdin.write(segment_to_send.numpy().tobytes())
+            self.streamer.ffmpeg_process.stdin.flush()
+
+            with self.lock:
+                self.last_yielded_offset = end_offset
+                self.total_yielded += total_samples
+
+
 class Streamer:
     def __init__(self):
         self.HLS_DIR = 'hls_stream'
-        os.makedirs(self.HLS_DIR, exist_ok=True)
+        self.cleanup_hls_dir()
         self.buffer = []  # [(timestamp, chunk), ...]
         self.ffmpeg_process = self.start_hls_stream()
-        self.feed_thread = threading.Thread(target=self.feed_audio_loop, daemon=True)
-        self.feed_thread.start()
+        # self.feed_thread = threading.Thread(target=self.feed_audio_loop, daemon=True)
+        # self.feed_thread.start()
 
     def add_audio(self, chunk, timestamp):
         """Modified to accept timestamp with chunk"""
         self.buffer.append((timestamp, chunk))
 
-    def get_chunk_to_play(self):
-        """Get the most recent chunk that's ready to play, drop older chunks"""
-        if not self.buffer:
-            return None
-
-        current_time = time.time()
-        target_time = current_time - PLAYBACK_DELAY
-        
-        # Find the last chunk that should be played
-        play_idx = -1
-        for i, (timestamp, _) in enumerate(self.buffer):
-            if timestamp <= target_time:
-                play_idx = i
-            else:
-                break
-
-        if play_idx == -1:
-            return None
-
-        # Get the last valid chunk and remove all older chunks
-        _, chunk_to_play = self.buffer[play_idx]
-        self.buffer = self.buffer[play_idx + 1:]
-        return chunk_to_play
-
-    def flush_buffer(self):
-        chunk = self.get_chunk_to_play()
-        if chunk is None:
-            return
-        
-        try:
-            print(f"Playing chunk of size: {len(chunk)}, buffer size: {len(self.buffer)}")
-            self.ffmpeg_process.stdin.write(chunk.numpy().tobytes())
-            self.ffmpeg_process.stdin.flush()
-        except Exception as e:
-            print("Error writing to FFmpeg stdin:", e)
-
-    def feed_audio_loop(self):
-        while True:
-            self.flush_buffer()
-            time.sleep(0.1)  # Check every 100ms
+    def cleanup_hls_dir(self):
+        """Remove all existing HLS stream files"""
+        if os.path.exists(self.HLS_DIR):
+            for file in glob.glob(os.path.join(self.HLS_DIR, '*')):
+                try:
+                    os.remove(file)
+                except Exception as e:
+                    print(f"Error removing {file}: {e}")
+        os.makedirs(self.HLS_DIR, exist_ok=True)
 
     def start_hls_stream(self, sample_rate=22050, channels=1):
         output_path = os.path.join(self.HLS_DIR, "stream.m3u8")

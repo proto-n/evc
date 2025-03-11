@@ -23,6 +23,7 @@
     let sourceNode;
     let processorNode;
     const SAMPLE_RATE = 22050;
+    let totalSamplesSent = 0;  // Track total samples sent
 
     socket.on('connect', function(){
       console.log("Successfully connected to server");
@@ -51,6 +52,7 @@
 
     document.getElementById('recordButton').addEventListener('click', async () => {
       if (!isRecording) {
+        totalSamplesSent = 0;  // Reset counter when starting new recording
         const deviceId = document.getElementById('deviceSelect').value;
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -76,8 +78,9 @@
             const normalizedData = Array.from(audioData);
             socket.emit('audio_data', {
               data: normalizedData,
-              clientTime: Date.now() / 1000
+              offset: totalSamplesSent
             });
+            totalSamplesSent += normalizedData.length;
           }
         };
 
