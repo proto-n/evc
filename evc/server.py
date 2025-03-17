@@ -17,6 +17,7 @@ import numpy as np
 import glob
 from typing import Dict, List, Callable
 from collections import defaultdict
+from multiprocessing import Process, Queue
 
 PLAYBACK_DELAY = 10  # seconds
 CHUNK_SIZE = 22050 * 5  # 5 seconds at 22050 Hz
@@ -224,6 +225,19 @@ class ReceiveBuffer(EventEmitter):
                 self.total_yielded += total_samples
 
 
+def worker_process(task_queue, result_queue):
+    import numpy as np
+
+    while True:
+        full_chunk, last_seg_len = task_queue.get()
+        if full_chunk is None:  # Shutdown signal
+            break
+        # Dummy processing: scale and clip (simulate intensive processing)
+        processed_chunk = full_chunk.astype(np.float32)
+        processed_chunk = np.clip(processed_chunk * 1.1, -32768, 32767).astype(np.int16)
+        result_queue.put((processed_chunk, last_seg_len))
+
+
 class ChunkProcessor(EventEmitter):
     def __init__(self, sample_rate=22050):
         super().__init__()
@@ -232,12 +246,20 @@ class ChunkProcessor(EventEmitter):
         self.running = True
         self.lock = threading.Lock()
 
+        # Set up multiprocessing queues and start the worker process
+        self.task_queue = Queue()
+        self.result_queue = Queue()
+        self.worker_process = Process(
+            target=worker_process, args=(self.task_queue, self.result_queue)
+        )
+        self.worker_process.start()
+
         # Start processor thread
         self.process_thread = threading.Thread(target=self._process_loop, daemon=True)
         self.process_thread.start()
 
     def handle_audio_segment(self, segment_dict):
-        """Receive 1-second segments from ReceiveBuffer"""
+        """Receive 1-second segments from ReceiveBuffer."""
         audio_data = np.frombuffer(segment_dict["audio"], dtype=np.int16)
         with self.lock:
             self.buffer.append(audio_data)
@@ -245,40 +267,39 @@ class ChunkProcessor(EventEmitter):
                 self.buffer.popleft()
 
     def _process_loop(self):
-        """Process 5-second overlapping windows"""
+        """Process 5-second overlapping windows using multiprocessing queues."""
         while self.running:
             with self.lock:
                 if len(self.buffer) >= 5:
                     # Concatenate last 5 seconds
                     full_chunk = np.concatenate(list(self.buffer))
-                    self.buffer.popleft()
+                    # Slide the window by popping the oldest chunk
+                    popped_chunk = self.buffer.popleft()
+                    # Determine the length of the last segment (to forward only that part)
+                    if self.buffer:
+                        last_seg_len = len(self.buffer[-1])
+                    else:
+                        last_seg_len = len(popped_chunk)
+                    # Put the full chunk in the task queue for processing
+                    self.task_queue.put((full_chunk, last_seg_len))
+            # Try to get the processed result (if available) with a short timeout.
+            try:
+                processed_chunk, last_seg_len = self.result_queue.get(timeout=0.1)
+                last_second = processed_chunk[-last_seg_len:]
+                self.emit("processed_audio", {"audio": last_second.tobytes()})
+            except Exception:
+                # If no result is ready, continue looping
+                pass
 
-                    # Simulate intense processing (~0.5 sec)
-                    processed_chunk = self._process_chunk(full_chunk)
-
-                    # Forward only the last 1 second
-                    last_second = processed_chunk[-len(self.buffer[-1]) :]
-                    self.emit(
-                        "processed_audio",
-                        {"audio": last_second.tobytes()},
-                    )
-
-            time.sleep(0.01)  # Don't burn CPU
-
-    def _process_chunk(self, chunk):
-        """Simulate intensive processing"""
-        # Simulate 0.5 seconds of heavy computation
-        # time.sleep(0.5)
-
-        # Do some dummy processing
-        chunk = chunk.astype(np.float32)
-        chunk = np.clip(chunk * 1.1, -32768, 32767).astype(np.int16)
-        return chunk
+            time.sleep(0.01)  # Prevent high CPU usage
 
     def cleanup(self):
         self.running = False
         if self.process_thread.is_alive():
             self.process_thread.join(timeout=1.0)
+        # Signal the worker process to exit and join it.
+        self.task_queue.put(None)
+        self.worker_process.join(timeout=1.0)
 
 
 class Streamer:
