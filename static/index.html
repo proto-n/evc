@@ -1,12 +1,21 @@
 <!DOCTYPE html>
 <html>
+
 <head>
   <title>Audio Recording Demo</title>
   <style>
-    .recording { background-color: red !important; }
-    select, button { padding: 10px; margin: 10px; }
+    .recording {
+      background-color: red !important;
+    }
+
+    select,
+    button {
+      padding: 10px;
+      margin: 10px;
+    }
   </style>
 </head>
+
 <body>
   <select id="deviceSelect"></select>
   <button id="recordButton">Start Recording</button>
@@ -16,7 +25,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/3.1.3/socket.io.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
   <script type="text/javascript">
-    const socket = io(location.protocol+'//'+location.hostname+':{{ port }}/');
+    const socket = io(location.protocol + '//' + location.hostname + ':{{ port }}/');
     let isRecording = false;
     let mediaRecorder;
     let audioContext;
@@ -25,8 +34,27 @@
     const SAMPLE_RATE = 22050;
     let totalSamplesSent = 0;  // Track total samples sent
 
-    socket.on('connect', function(){
+    function resetRecordingState() {
+      if (processorNode) {
+        processorNode.disconnect();
+        sourceNode.disconnect();
+        if (audioContext && audioContext.state !== 'closed') {
+          audioContext.close();
+        }
+      }
+      isRecording = false;
+      totalSamplesSent = 0;
+      document.getElementById('recordButton').textContent = 'Start Recording';
+      document.getElementById('recordButton').classList.remove('recording');
+    }
+
+    socket.on('connect', function () {
       console.log("Successfully connected to server");
+    });
+
+    socket.on('disconnect', function () {
+      console.log("Disconnected from server");
+      resetRecordingState();
     });
 
     // Get available audio devices
@@ -87,16 +115,11 @@
         document.getElementById('recordButton').textContent = 'Stop Recording';
         document.getElementById('recordButton').classList.add('recording');
       } else {
-        if (processorNode) {
-          processorNode.disconnect();
-          sourceNode.disconnect();
-          await audioContext.close();
-        }
-        document.getElementById('recordButton').textContent = 'Start Recording';
-        document.getElementById('recordButton').classList.remove('recording');
+        resetRecordingState();
       }
       isRecording = !isRecording;
     });
   </script>
 </body>
+
 </html>

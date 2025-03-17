@@ -38,15 +38,38 @@ class AppHandler(socketio.AsyncNamespace):
     def __init__(self, args):
         self.loop = asyncio.get_event_loop()
         self.port = args["port"]
-        self.buffer = ReceiveBuffer()  # Create buffer first
-        self.streamer = Streamer(self.buffer)  # Pass buffer to streamer
         self.sample_rate = 22050
-        self.min_sample_diff = None  # Minimum observed time difference
-        self.start_time = None
-        self.last_stats_time = time.time()
+        self.is_running = False
         super(AppHandler, self).__init__("/")
 
+    def initialize_components(self):
+        """Initialize all components and variables"""
+        self.buffer = ReceiveBuffer()
+        self.streamer = Streamer(self.buffer)
+        self.min_sample_diff = None
+        self.start_time = None
+        self.last_stats_time = time.time()
+        self.is_running = True
+
+    def cleanup_components(self):
+        """Cleanup all components and reset state"""
+        self.is_running = False
+        if hasattr(self, "streamer"):
+            self.streamer.cleanup()
+            delattr(self, "streamer")
+        if hasattr(self, "buffer"):
+            # Stop the buffer's processing thread
+            if hasattr(self.buffer, "process_thread"):
+                self.buffer.running = False
+                self.buffer.process_thread.join(timeout=1.0)
+            delattr(self, "buffer")
+        self.min_sample_diff = None
+        self.start_time = None
+        self.last_stats_time = None
+
     async def on_audio_data(self, sid, data):
+        if not self.is_running:
+            return
         server_time = time.time()
         if self.start_time is None:
             self.start_time = time.time()
@@ -84,12 +107,15 @@ class AppHandler(socketio.AsyncNamespace):
         self.emit("command", data)
 
     async def on_connect(self, sid, environ):
+        """Initialize everything on new connection"""
+        self.initialize_components()
         await self.send_state()
-        return
+        print("Client connected, initialized components")
 
     def on_disconnect(self, sid, reason):
-        if hasattr(self, "streamer"):
-            self.streamer.cleanup()
+        """Cleanup everything on disconnect"""
+        print("Client disconnected, cleaning up components")
+        self.cleanup_components()
 
 
 class TornadoHandler(tornado.web.RequestHandler):
@@ -315,41 +341,38 @@ class Streamer:
                 self.ffmpeg_process.kill()
 
     def start_rtp_stream(self, sample_rate=22050, channels=1):
+        # fmt: off
         ffmpeg_cmd = [
             "ffmpeg",
             "-re",
-            # First input: a silent audio source
-            "-f",
-            "lavfi",
-            "-i",
-            f"anullsrc=channel_layout=mono:sample_rate={sample_rate}",
-            # Second input: piped audio
-            "-f",
-            "s16le",
-            "-ar",
-            str(sample_rate),
-            "-ac",
-            str(channels),
-            "-i",
-            "pipe:0",
-            # Mix the two inputs: when no data comes on the pipe, the silent source fills in
+            "-vsync", "1",  # Synchronize timestamps properly
+
+            # First input: silent audio source
+            "-f", "lavfi",
+            "-i", f"anullsrc=channel_layout=mono:sample_rate={sample_rate}",
+
+            # Second input: piped audio from stdin
+            "-f", "s16le",
+            "-ar", str(sample_rate),
+            "-ac", str(channels),
+            "-stream_loop", "-1",
+            # "-fflags", "+ignoreeof",  # Ignore EOF to prevent stopping
+            "-i", "pipe:0",
+
+            # Mix silent source with input; silence fills gaps when input stops
             "-filter_complex",
-            "[1:a]aresample=async=1,asetpts=PTS-STARTPTS[a1]; [0:a][a1]amix=inputs=2:duration=longest:dropout_transition=0",
-            "-acodec",
-            "aac",
-            "-b:a",
-            "128k",
-            # (Optional reconnect options – note these are typically for network input)
-            "-reconnect",
-            "1",
-            "-reconnect_streamed",
-            "1",
-            "-reconnect_delay_max",
-            "5",
-            "-f",
-            "rtp_mpegts",
+            "[1:a]aresample=async=1000,asetpts=PTS-STARTPTS[a1];"
+            "[0:a][a1]amix=inputs=2:duration=longest:dropout_transition=0",
+
+            "-acodec", "aac",
+            "-b:a", "128k",
+
+            # RTP streaming settings
+            "-f", "rtp_mpegts",
             "rtp://127.0.0.1:1234",
         ]
+        # fmt: on
+
         return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
 
