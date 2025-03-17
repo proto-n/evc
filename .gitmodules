@@ -1,0 +1,3 @@
+[submodule "evc/seedvc"]
+	path = evc/seedvc
+	url = https://github.com/Plachtaa/seed-vc.git
