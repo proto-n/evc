@@ -245,6 +245,8 @@ class ChunkProcessor(EventEmitter):
         self.buffer = deque(maxlen=5)  # Store last 5 seconds
         self.running = True
         self.lock = threading.Lock()
+        self.crossfade_time = int(0.2 * sample_rate)  # 0.2 seconds crossfade
+        self.previous_ending = None
 
         # Set up multiprocessing queues and start the worker process
         self.task_queue = Queue()
@@ -266,6 +268,31 @@ class ChunkProcessor(EventEmitter):
             while len(self.buffer) > 5:
                 self.buffer.popleft()
 
+    def _crossfade(
+        self, chunk1: np.ndarray, chunk2: np.ndarray, overlap: int
+    ) -> np.ndarray:
+        """Apply crossfade between two audio chunks
+
+        Args:
+            chunk1: First audio chunk
+            chunk2: Second audio chunk
+            overlap: Number of samples to overlap
+
+        Returns:
+            Crossfaded audio chunk
+        """
+        fade_out = np.cos(np.linspace(0, np.pi / 2, overlap)) ** 2
+        fade_in = np.cos(np.linspace(np.pi / 2, 0, overlap)) ** 2
+
+        if len(chunk2) < overlap:
+            chunk2[:overlap] = (
+                chunk2[:overlap] * fade_in[: len(chunk2)]
+                + (chunk1[-overlap:] * fade_out)[: len(chunk2)]
+            )
+        else:
+            chunk2[:overlap] = chunk2[:overlap] * fade_in + chunk1[-overlap:] * fade_out
+        return chunk2
+
     def _process_loop(self):
         """Process 5-second overlapping windows using multiprocessing queues."""
         while self.running:
@@ -285,8 +312,21 @@ class ChunkProcessor(EventEmitter):
             # Try to get the processed result (if available) with a short timeout.
             try:
                 processed_chunk, last_seg_len = self.result_queue.get(timeout=0.1)
-                last_second = processed_chunk[-last_seg_len:]
-                self.emit("processed_audio", {"audio": last_second.tobytes()})
+                # Extract the segment to emit (with extra samples for crossfade)
+                current_segment = processed_chunk[
+                    -last_seg_len - self.crossfade_time : -self.crossfade_time
+                ]
+
+                # Apply crossfade if we have a previous ending
+                if self.previous_ending is not None:
+                    current_segment = self._crossfade(
+                        self.previous_ending, current_segment, self.crossfade_time
+                    )
+
+                # Store the ending for next crossfade
+                self.previous_ending = processed_chunk[-self.crossfade_time :]
+
+                self.emit("processed_audio", {"audio": current_segment.tobytes()})
             except Exception:
                 # If no result is ready, continue looping
                 pass
@@ -295,6 +335,7 @@ class ChunkProcessor(EventEmitter):
 
     def cleanup(self):
         self.running = False
+        self.previous_ending = None
         if self.process_thread.is_alive():
             self.process_thread.join(timeout=1.0)
         # Signal the worker process to exit and join it.
