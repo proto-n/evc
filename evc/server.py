@@ -347,11 +347,11 @@ class ChunkProcessor(EventEmitter):
 class Streamer:
     def __init__(self, buffer: ReceiveBuffer, audio_port: int):
         self.HLS_DIR = "hls_stream"
-        self.ffmpeg_process = self.start_rtp_stream()
+        self.audio_port = audio_port
         self.input_buffer = deque()
         self.buffer_lock = threading.Lock()
         self.running = True
-        self.audio_port = audio_port
+        self.ffmpeg_process = self.start_rtp_stream()
 
         # Create processor
         self.processor = ChunkProcessor()
