@@ -48,4 +48,5 @@ logs/
 .env.production.local
 
 recordings
-hls_stream
+hls_stream/*
+!hls_stream/empty
