@@ -39,6 +39,7 @@ class AppHandler(socketio.AsyncNamespace):
     def __init__(self, args):
         self.loop = asyncio.get_event_loop()
         self.port = args["port"]
+        self.audio_port = args["audio_port"]
         self.sample_rate = 22050
         self.is_running = False
         super(AppHandler, self).__init__("/")
@@ -46,7 +47,7 @@ class AppHandler(socketio.AsyncNamespace):
     def initialize_components(self):
         """Initialize all components and variables"""
         self.buffer = ReceiveBuffer()
-        self.streamer = Streamer(self.buffer)
+        self.streamer = Streamer(self.buffer, self.audio_port)
         self.min_sample_diff = None
         self.start_time = None
         self.last_stats_time = time.time()
@@ -344,12 +345,13 @@ class ChunkProcessor(EventEmitter):
 
 
 class Streamer:
-    def __init__(self, buffer: ReceiveBuffer):
+    def __init__(self, buffer: ReceiveBuffer, audio_port: int):
         self.HLS_DIR = "hls_stream"
         self.ffmpeg_process = self.start_rtp_stream()
         self.input_buffer = deque()
         self.buffer_lock = threading.Lock()
         self.running = True
+        self.audio_port = audio_port
 
         # Create processor
         self.processor = ChunkProcessor()
@@ -431,7 +433,7 @@ class Streamer:
 
             # RTP streaming settings
             "-f", "rtp_mpegts",
-            "rtp://127.0.0.1:1234",
+            "rtp://127.0.0.1:" + str(self.audio_port),
         ]
         # fmt: on
 
