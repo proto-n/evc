@@ -40,6 +40,7 @@ class AppHandler(socketio.AsyncNamespace):
         self.loop = asyncio.get_event_loop()
         self.port = args["port"]
         self.audio_port = args["audio_port"]
+        self.stream_type = args["stream_type"]
         self.sample_rate = 22050
         self.is_running = False
         super(AppHandler, self).__init__("/")
@@ -47,7 +48,7 @@ class AppHandler(socketio.AsyncNamespace):
     def initialize_components(self):
         """Initialize all components and variables"""
         self.buffer = ReceiveBuffer()
-        self.streamer = Streamer(self.buffer, self.audio_port)
+        self.streamer = Streamer(self.buffer, self.audio_port, self.stream_type)
         self.min_sample_diff = None
         self.start_time = None
         self.last_stats_time = time.time()
@@ -345,13 +346,17 @@ class ChunkProcessor(EventEmitter):
 
 
 class Streamer:
-    def __init__(self, buffer: ReceiveBuffer, audio_port: int):
+    def __init__(self, buffer: ReceiveBuffer, audio_port: int, stream_type: str):
         self.HLS_DIR = "hls_stream"
         self.audio_port = audio_port
         self.input_buffer = deque()
         self.buffer_lock = threading.Lock()
         self.running = True
-        self.ffmpeg_process = self.start_rtp_stream()
+        self.stream_type = stream_type
+        if self.stream_type == "rtp":
+            self.ffmpeg_process = self.start_rtp_stream()
+        else:
+            self.ffmpeg_process = self.start_hls_stream()
 
         # Create processor
         self.processor = ChunkProcessor()
@@ -437,6 +442,26 @@ class Streamer:
         ]
         # fmt: on
 
+        return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+
+    def start_hls_stream(self, sample_rate=22050, channels=1):
+        output_path = os.path.join(self.HLS_DIR, "stream.m3u8")
+        # fmt: off
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-f", "s16le",
+            "-ar", str(sample_rate),
+            "-ac", str(channels),
+            "-i", "pipe:0",
+            "-acodec", "aac",
+            "-b:a", "128k",
+            "-f", "hls",
+            "-hls_time", "2",
+            "-hls_list_size", "5",
+            "-hls_flags", "delete_segments",
+            output_path
+        ]
+        # fmt: on
         return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
 

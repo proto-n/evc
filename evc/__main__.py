@@ -18,6 +18,14 @@ parser.add_argument(
     default=1234,
     help="port to listen on",
 )
+parser.add_argument(
+    "--stream_type",
+    metavar="[port]",
+    type=str,
+    nargs="?",
+    default="rtp",
+    help="type of stream",
+)
 
 args = vars(parser.parse_args())
 main(args)
