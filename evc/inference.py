@@ -1,6 +1,10 @@
-import os
-
 import numpy as np
+import os
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.abspath(os.path.join(current_dir, "seedvc"))
+sys.path.insert(0, repo_root)
 
 os.environ["HF_HUB_CACHE"] = "./checkpoints/hf_cache"
 import warnings
@@ -16,7 +20,7 @@ import time
 import torchaudio
 import librosa
 
-from hf_utils import load_custom_model_from_hf
+from seedvc.hf_utils import load_custom_model_from_hf
 
 
 class SeedVCInference:
@@ -30,15 +34,27 @@ class SeedVCInference:
     OVERLAP_FRAMES = 16
     NUM_MEL_BINS = 80
 
-    def __init__(self, args: argparse.Namespace):
+    def __init__(
+        self,
+        config_path,
+        checkpoint_path,
+        diffusion_steps,
+        length_adjust,
+        inference_cfg_rate,
+    ):
         """Initialize voice conversion model
 
         Args:
             args: Command line arguments containing model configuration
         """
-        self.args = args
+        self.config_path = config_path
+        self.checkpoint_path = checkpoint_path
+        self.diffusion_steps = diffusion_steps
+        self.length_adjust = length_adjust
+        self.inference_cfg_rate = inference_cfg_rate
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.fp16 = args.fp16
+        self.fp16 = True
         self.window_size_samples = self.WINDOW_SIZE_SECONDS * self.SAMPLE_RATE_16K
         self.overlap_samples = self.OVERLAP_TIME * self.SAMPLE_RATE_16K
 
@@ -87,14 +103,14 @@ class SeedVCInference:
 
     def load_models(self) -> None:
         """Load and initialize all model components"""
-        if not os.path.exists(self.args.config_path):
-            raise FileNotFoundError(f"Config file not found: {self.args.config_path}")
-        if not os.path.exists(self.args.checkpoint_path):
+        if not os.path.exists(self.config_path):
+            raise FileNotFoundError(f"Config file not found: {self.config_path}")
+        if not os.path.exists(self.checkpoint_path):
             raise FileNotFoundError(
-                f"Checkpoint file not found: {self.args.checkpoint_path}"
+                f"Checkpoint file not found: {self.checkpoint_path}"
             )
 
-        config = yaml.safe_load(open(self.args.config_path, "r"))
+        config = yaml.safe_load(open(self.config_path, "r"))
         model_params = recursive_munch(config["model_params"])
         self.sr = config["preprocess_params"]["sr"]
         self.hop_length = config["preprocess_params"]["spect_params"]["hop_length"]
@@ -107,7 +123,7 @@ class SeedVCInference:
         self.model, _, _, _ = load_checkpoint(
             self.model,
             None,
-            self.args.checkpoint_path,
+            self.checkpoint_path,
             load_only_params=True,
             ignore_modules=[],
             is_distributed=False,
@@ -181,7 +197,7 @@ class SeedVCInference:
         """Adjust sequence length using length regulator"""
         target_len = mel.size(2)
         if is_source:
-            target_len = int(target_len * self.args.length_adjust)
+            target_len = int(target_len * self.length_adjust)
         target_lengths = torch.LongTensor([target_len]).to(mel.device)
 
         condition, *_ = self.model.length_regulator(
@@ -279,8 +295,8 @@ class SeedVCInference:
                 mel2,
                 style2,
                 None,
-                self.args.diffusion_steps,
-                inference_cfg_rate=self.args.inference_cfg_rate,
+                self.diffusion_steps,
+                inference_cfg_rate=self.inference_cfg_rate,
                 temperature=1.0,
             )
 
@@ -391,7 +407,13 @@ def main(args: argparse.Namespace) -> None:
 
     # Initialize and run conversion
     try:
-        vc = SeedVCInference(args)
+        vc = SeedVCInference(
+            args.config_path,
+            args.checkpoint_path,
+            args.diffusion_steps,
+            args.length_adjust,
+            args.inference_cfg_rate,
+        )
         vc.load_models()
 
         time_start = time.time()
