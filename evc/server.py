@@ -18,6 +18,12 @@ import glob
 from typing import Dict, List, Callable
 from collections import defaultdict
 from multiprocessing import Process, Queue
+import os
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.abspath(os.path.join(current_dir, "seedvc"))
+sys.path.insert(0, repo_root)
 
 PLAYBACK_DELAY = 10  # seconds
 CHUNK_SIZE = 22050 * 5  # 5 seconds at 22050 Hz
@@ -229,16 +235,68 @@ class ReceiveBuffer(EventEmitter):
 
 def worker_process(task_queue, result_queue):
     import numpy as np
+    import torch
+    import torchaudio
+    from .inference import SeedVCInference
+    import librosa
 
-    while True:
-        full_chunk, last_seg_len = task_queue.get()
-        if full_chunk is None:  # Shutdown signal
-            break
-        # Dummy processing: scale and clip (simulate intensive processing)
-        processed_chunk = full_chunk.astype(np.float32)
-        processed_chunk = np.clip(processed_chunk * 1.1, -32768, 32767).astype(np.int16)
-        result_queue.put((processed_chunk, last_seg_len))
+    # Initialize voice conversion model
+    vc = SeedVCInference(
+        "/mnt/idms/kdomokos/workspace/discc/seed-vc/models/config_dit_mel_seed_uvit_whisper_small_wavenet.yml",
+        "/mnt/idms/kdomokos/workspace/discc/seed-vc/runs/tune-run-3-target/DiT_epoch_00000_step_00100.pth",
+        30,  # diffusion steps
+        1,  # length adjust
+        0.97,  # inference cfg rate
+    )
+    vc.load_models()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Load and process reference audio once
+    ref_audio = librosa.load(
+        "/mnt/idms/kdomokos/workspace/discc/seed-vc/test2/out.wav", sr=22050
+    )[0]
+    ref_audio = torch.tensor(ref_audio).unsqueeze(0).float().to(device)
+    ref_audio = ref_audio[:, : 22050 * vc.MAX_REFERENCE_DURATION]
+
+    # prepare reference
+    ref_waves_16k = torchaudio.functional.resample(ref_audio, 22050, vc.SAMPLE_RATE_16K)
+    ref_tokens = vc.semantic_fn(ref_waves_16k)
+    mel_ref = vc.mel_fn(ref_audio)
+    style = vc._extract_style(ref_waves_16k)
+    ref_cond = vc._regulate_length(ref_tokens, mel_ref, is_source=False)
+    first = True
+
+    with open("log.txt", "a") as f:
+        while True:
+            full_chunk, last_seg_len = task_queue.get()
+            if full_chunk is None:  # Shutdown signal
+                break
+
+            try:
+                with torch.no_grad():
+                    # prepare source
+                    source_audio = torch.tensor(full_chunk).float() / 32768.0
+                    source_audio = source_audio.unsqueeze(0).to(device)
+                    source_waves_16k = torchaudio.functional.resample(
+                        source_audio, 22050, vc.SAMPLE_RATE_16K
+                    )
+                    source_tokens = vc.semantic_fn(source_waves_16k)
+                    mel_source = vc.mel_fn(source_audio)
+                    source_cond = vc._regulate_length(source_tokens, mel_source, is_source=True)
+
+                    vc_wave = vc._process_frame(source_cond, ref_cond, mel_ref, style)
+
+                    # Convert back to int16 format
+                    processed_chunk = (vc_wave.squeeze(0).cpu().numpy() * 32768).astype(np.int16)
+                    processed_chunk = np.clip(processed_chunk * 1.1, -32768, 32767).astype(np.int16)
+                    if first:
+                        time.sleep(1)
+                        first = False
+                    result_queue.put((processed_chunk, last_seg_len))
+
+            except Exception as e:
+                f.write(f"Error in voice conversion: {e}\n")
+                f.flush()
 
 class ChunkProcessor(EventEmitter):
     def __init__(self, sample_rate=22050):

@@ -14,13 +14,13 @@ import yaml
 
 warnings.simplefilter("ignore")
 
-from seedvc.modules.commons import *
+from .seedvc.modules.commons import *
 import time
 
 import torchaudio
 import librosa
 
-from seedvc.hf_utils import load_custom_model_from_hf
+from .seedvc.hf_utils import load_custom_model_from_hf
 
 
 class SeedVCInference:
@@ -206,7 +206,7 @@ class SeedVCInference:
         return condition
 
     def _setup_vocoder(self, vocoder_params):
-        from seedvc.modules.bigvgan import bigvgan
+        from .seedvc.modules.bigvgan import bigvgan
 
         bigvgan_model = bigvgan.BigVGAN.from_pretrained(
             vocoder_params.name, use_cuda_kernel=False
@@ -215,7 +215,7 @@ class SeedVCInference:
         return bigvgan_model.eval().to(self.device)
 
     def _setup_campplus(self):
-        from seedvc.modules.campplus.DTDNN import CAMPPlus
+        from .seedvc.modules.campplus.DTDNN import CAMPPlus
 
         campplus_ckpt_path = load_custom_model_from_hf(
             "funasr/campplus", "campplus_cn_common.bin", config_filename=None
@@ -237,7 +237,7 @@ class SeedVCInference:
             "fmax": None if spect_params.get("fmax", "None") == "None" else 8000,
             "center": False,
         }
-        from seedvc.modules.audio import mel_spectrogram
+        from .seedvc.modules.audio import mel_spectrogram
 
         return lambda x: mel_spectrogram(x, **mel_fn_args)
 
